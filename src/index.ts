@@ -271,16 +271,18 @@ function renderSearchResult(toolResult: any, { expanded, isPartial }: { expanded
 	}
 
 	const matches = getSearchMatches(toolResult);
+
+	if (expanded) {
+		const details = getSearchDetails(toolResult);
+		const lines = renderExpandedSearchResultLines(matches, details, fg);
+		return new Text(lines.join("\n"), 0, 0);
+	}
+
 	if (!matches.length) return new Text(fg("muted", "No results"), 0, 0);
 
-	const shown = expanded ? matches : matches.slice(0, COLLAPSED_RESULT_COUNT);
-	const lines = shown.map((match) => {
-		const score = Number.isFinite(match.score) ? match.score.toFixed(3) : "?";
-		const location = formatSearchMatchLocation(match);
-		const language = match.language ? ` ${match.language}` : "";
-		return `${fg("dim", `${match.rank}.`)} ${fg("toolOutput", location)}${fg("dim", `${language} ${score}`)}`;
-	});
-	if (!expanded && matches.length > shown.length) {
+	const shown = matches.slice(0, COLLAPSED_RESULT_COUNT);
+	const lines = shown.map((match) => `${fg("dim", "•")} ${formatSearchMatchSummary(match, fg)}`);
+	if (matches.length > shown.length) {
 		lines.push(fg("muted", `... ${matches.length - shown.length} more`));
 	}
 	return new Text(lines.join("\n"), 0, 0);
@@ -300,6 +302,35 @@ function formatSearchMatchLocation(match: SearchMatch): string {
 	if (match.startLine === undefined) return match.path;
 	const range = match.endLine !== undefined && match.endLine !== match.startLine ? `${match.startLine}-${match.endLine}` : String(match.startLine);
 	return `${match.path}:${range}`;
+}
+
+function formatSearchMatchSummary(match: SearchMatch, fg: (key: string, value: string) => string): string {
+	const score = Number.isFinite(match.score) ? match.score.toFixed(3) : "?";
+	const language = match.language ? ` ${match.language}` : "";
+	return `${fg("toolOutput", formatSearchMatchLocation(match))}${fg("dim", `${language} ${score}`)}`;
+}
+
+function renderExpandedSearchResultLines(matches: SearchMatch[], details: Partial<SearchDetails> | undefined, fg: (key: string, value: string) => string): string[] {
+	const lines = [fg("toolTitle", `Search results (${matches.length})`)];
+	if (details?.query) lines.push(`${fg("dim", "query:")} ${fg("accent", JSON.stringify(details.query))}`);
+	if (details?.path) lines.push(`${fg("dim", "path:")} ${fg("toolOutput", details.path)}`);
+	if (details?.projectRoot) lines.push(`${fg("dim", "root:")} ${fg("toolOutput", details.projectRoot)}`);
+	if (details?.backgroundIndex) lines.push(`${fg("dim", "background index:")} ${details.backgroundIndex}`);
+	if (details?.truncated) lines.push(fg("warning", "model-facing output was truncated"));
+	lines.push("");
+	if (!matches.length) {
+		lines.push(fg("muted", "No parsed matches"));
+		return lines;
+	}
+	for (const match of matches) {
+		lines.push(`${fg("dim", "•")} ${formatSearchMatchSummary(match, fg)}`);
+	}
+	return lines;
+}
+
+function getSearchDetails(toolResult: any): Partial<SearchDetails> | undefined {
+	const details = toolResult?.details;
+	return details && typeof details === "object" ? details : undefined;
 }
 
 function getSearchMatches(toolResult: any): SearchMatch[] {
