@@ -79,15 +79,15 @@ The extension registers exactly one agent-facing tool:
 search({
   query: string,
   limit?: number, // default 10, max 25
-  path?: string   // optional project-relative file, directory, or glob
+  path?: string   // optional project-relative file or glob; use `src/**` for recursive directory search
 })
 ```
 
-`search` runs `ccc search --limit N [--path PATH] QUERY` from the resolved project root. It does **not** run `--refresh`; indexing is managed in the background so searches stay fast. If background indexing is running or unhealthy, results include a note that they may be stale.
+`search` runs `ccc search --limit N [--path PATH] QUERY` from the resolved project root. It does **not** run `--refresh`; indexing is managed in the background so searches stay fast. If background indexing is running or unhealthy, results include a note that they may be stale. Omit `path` unless the user names an area or broad results are noisy. Files like `src/index.ts` work directly; for recursive directory search, use glob form such as `src/**`, not plain `src` or `src/`.
 
 In Pi's TUI, the tool call renders as `search "<query>"`. The collapsed result body renders a compact bulleted summary with relative path, line range, language, and CocoIndex score; the expanded view keeps the same bulleted match format for all parsed matches and adds search metadata such as query, path filter, project root, background index state, and truncation status. The model still receives the full CocoIndex snippets in the tool content.
 
-`path` is project-relative. Leading `@` is stripped for agent convenience, while absolute paths and `..` traversal are rejected.
+`path` is project-relative. Leading `@` is stripped for agent convenience, while absolute paths and `..` traversal are rejected. Directory-like filters are not normalized automatically in v1; pass an explicit glob such as `src/**` when you want everything under a directory.
 
 ## Project root and indexing
 

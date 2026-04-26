@@ -250,7 +250,7 @@ class CocoIndexRuntime {
 const SearchParams = Type.Object({
 	query: Type.String({ description: "Natural-language description of the code, behavior, concept, or responsibility to find." }),
 	limit: Type.Optional(Type.Number({ minimum: 1, maximum: MAX_LIMIT, description: `Maximum number of matches to return. Defaults to ${DEFAULT_LIMIT}.` })),
-	path: Type.Optional(Type.String({ description: "Optional project-relative file, directory, or glob to narrow semantic search. Omit unless the user named a specific area." })),
+	path: Type.Optional(Type.String({ description: "Optional project-relative file or glob to narrow semantic search. Omit unless the user named a specific area or broad results were too noisy. Files like `src/index.ts` work directly; for recursive directory search, use a glob like `src/**` rather than plain `src` or `src/`." })),
 });
 
 
@@ -353,7 +353,8 @@ export default function cocoindexExtension(pi: ExtensionAPI): void {
 		promptSnippet: "search: Semantic code search over the current repository using CocoIndex Code. The index is maintained automatically in the background.",
 		promptGuidelines: [
 			"Use search for semantic code discovery when you need to find code by behavior, concept, responsibility, or natural-language description.",
-			"For search.path, use a project-relative path or glob only when the user explicitly names an area or a broader search was too noisy.",
+			"Omit search.path unless the user explicitly names an area or broad repository-wide results were too noisy.",
+			"When using search.path, pass a project-relative file or glob. Files like `src/index.ts` work directly; for recursive directory search, use a glob like `src/**`, not plain `src` or `src/`.",
 		],
 		parameters: SearchParams,
 		renderCall: renderSearchCall,
