@@ -20,6 +20,7 @@ const MAX_QUERY_PREVIEW_CHARS = 96;
 const MAX_PATH_PREVIEW_CHARS = 72;
 
 const SEARCH_TIMEOUT_MS = 60_000;
+const SEARCH_STATUS_TIMEOUT_MS = 1_500;
 const STATUS_TIMEOUT_MS = 30_000;
 const LONG_COMMAND_TIMEOUT_MS = 5 * 60_000;
 const INDEX_TIMEOUT_MS = 30 * 60_000;
@@ -62,16 +63,26 @@ interface SearchMatch {
 }
 
 interface SearchDetails {
-	command: string;
+	status: "ok" | "indexing";
+	command?: string;
 	cwd: string;
 	projectRoot: string;
 	query: string;
 	limit: number;
 	path?: string;
-	backgroundIndex: "started" | "already-running" | "skipped-cooldown" | "disposed";
+	backgroundIndex: "not-started" | "started" | "already-running" | "skipped-cooldown" | "disposed";
 	truncated: boolean;
 	matches: SearchMatch[];
+	message?: string;
+	retryable?: boolean;
 }
+
+type CocoIndexActivityUnknownReason = "timeout" | "exit-error" | "parse-error" | "spawn-error";
+
+type CocoIndexActivity =
+	| { kind: "indexing"; source: "internal" | "ccc-status"; message: string; rawStatus?: string }
+	| { kind: "idle"; source: "ccc-status"; rawStatus: string }
+	| { kind: "unknown"; source: "ccc-status"; reason: CocoIndexActivityUnknownReason; message: string; rawStatus?: string };
 
 type NotifyLevel = "info" | "warning" | "error";
 type LifecycleNotifier = (message: string, level?: NotifyLevel) => void;
@@ -100,8 +111,27 @@ class CccError extends Error {
 	readonly stdout: string;
 	readonly stderr: string;
 	readonly code: unknown;
+	readonly signal: unknown;
+	readonly killed: boolean;
+	readonly timedOut: boolean;
+	readonly cancelled: boolean;
+	readonly causeName?: string;
 
-	constructor(message: string, fields: { command: string; cwd: string; stdout?: string; stderr?: string; code?: unknown }) {
+	constructor(
+		message: string,
+		fields: {
+			command: string;
+			cwd: string;
+			stdout?: string;
+			stderr?: string;
+			code?: unknown;
+			signal?: unknown;
+			killed?: boolean;
+			timedOut?: boolean;
+			cancelled?: boolean;
+			causeName?: string;
+		},
+	) {
 		super(message);
 		this.name = "CccError";
 		this.command = fields.command;
@@ -109,6 +139,11 @@ class CccError extends Error {
 		this.stdout = fields.stdout ?? "";
 		this.stderr = fields.stderr ?? "";
 		this.code = fields.code;
+		this.signal = fields.signal;
+		this.killed = fields.killed ?? false;
+		this.timedOut = fields.timedOut ?? false;
+		this.cancelled = fields.cancelled ?? false;
+		this.causeName = fields.causeName;
 	}
 
 	get combinedOutput(): string {
@@ -271,13 +306,14 @@ function renderSearchResult(toolResult: any, { expanded, isPartial }: { expanded
 	}
 
 	const matches = getSearchMatches(toolResult);
+	const details = getSearchDetails(toolResult);
 
 	if (expanded) {
-		const details = getSearchDetails(toolResult);
 		const lines = renderExpandedSearchResultLines(matches, details, fg);
 		return new Text(lines.join("\n"), 0, 0);
 	}
 
+	if (details?.status === "indexing" && details.message) return new Text(fg("warning", details.message), 0, 0);
 	if (!matches.length) return new Text(fg("muted", "No results"), 0, 0);
 
 	const shown = matches.slice(0, COLLAPSED_RESULT_COUNT);
@@ -316,9 +352,14 @@ function renderExpandedSearchResultLines(matches: SearchMatch[], details: Partia
 	if (details?.path) metadata.push(`${fg("dim", "path:")} ${fg("toolOutput", details.path)}`);
 	if (details?.projectRoot) metadata.push(`${fg("dim", "root:")} ${fg("toolOutput", details.projectRoot)}`);
 	if (details?.backgroundIndex) metadata.push(`${fg("dim", "background index:")} ${details.backgroundIndex}`);
+	if (details?.retryable) metadata.push(`${fg("dim", "retryable:")} yes`);
 	if (details?.truncated) metadata.push(fg("warning", "model-facing output was truncated"));
 
 	const lines = metadata.length > 0 ? ["", ...metadata, ""] : [];
+	if (details?.status === "indexing" && details.message) {
+		lines.push(fg("warning", details.message));
+		return lines;
+	}
 	if (!matches.length) {
 		lines.push(fg("muted", "No parsed matches"));
 		return lines;
@@ -341,6 +382,65 @@ function getSearchMatches(toolResult: any): SearchMatch[] {
 
 function isSearchMatch(value: any): value is SearchMatch {
 	return value && typeof value.rank === "number" && typeof value.score === "number" && typeof value.path === "string";
+}
+
+function makeUnknownActivityRetryMessage(fields: {
+	root: string;
+	query: string;
+	limit: number;
+	path?: string;
+	activity: Extract<CocoIndexActivity, { kind: "unknown" }>;
+}): string {
+	const originalSearch = ["Original search:", `- query: ${JSON.stringify(fields.query)}`, `- limit: ${fields.limit}`];
+	if (fields.path) originalSearch.push(`- path: ${fields.path}`);
+	return [
+		`CocoIndex semantic search status could not be confirmed quickly for ${fields.root}.`,
+		`Reason: ${fields.activity.reason}.`,
+		"To avoid racing an active index operation, retry this search shortly.",
+		"Use other available tools such as read, bash, grep, find, or ls while CocoIndex settles, or run /cc-status for diagnostics.",
+		"",
+		...originalSearch,
+	].join("\n");
+}
+
+function makeIndexingRetryResult(fields: {
+	root: string;
+	query: string;
+	limit: number;
+	path?: string;
+	backgroundIndex: SearchDetails["backgroundIndex"];
+	activity?: CocoIndexActivity;
+	message?: string;
+}) {
+	const originalSearch = ["Original search:", `- query: ${JSON.stringify(fields.query)}`, `- limit: ${fields.limit}`];
+	if (fields.path) originalSearch.push(`- path: ${fields.path}`);
+	const reasonLine = fields.activity?.source === "ccc-status"
+		? "CocoIndex status reports that indexing is currently in progress."
+		: "The Pi extension already has an active CocoIndex indexing job.";
+	const message = fields.message ?? [
+		`CocoIndex semantic search is currently indexing for ${fields.root}.`,
+		reasonLine,
+		"Retry this search shortly; the semantic index is still being updated.",
+		"Use other available tools such as read, bash, grep, find, or ls to inspect files while indexing completes.",
+		"",
+		...originalSearch,
+	].join("\n");
+	return {
+		content: [{ type: "text" as const, text: message }],
+		details: {
+			status: "indexing" as const,
+			cwd: fields.root,
+			projectRoot: fields.root,
+			query: fields.query,
+			limit: fields.limit,
+			path: fields.path,
+			backgroundIndex: fields.backgroundIndex,
+			truncated: false,
+			matches: [],
+			message,
+			retryable: true,
+		} satisfies SearchDetails,
+	};
 }
 
 export default function cocoindexExtension(pi: ExtensionAPI): void {
@@ -371,7 +471,35 @@ export default function cocoindexExtension(pi: ExtensionAPI): void {
 			}
 
 			const indexNotifier = makeLifecycleNotifier(ctx);
-			const start = runtime.startIndex(root, "search", { force: false, notify: indexNotifier });
+			const currentIndexState = runtime.getState(root);
+			let backgroundIndex: SearchDetails["backgroundIndex"] = "not-started";
+			if (currentIndexState.status === "running") {
+				return makeIndexingRetryResult({
+					root,
+					query,
+					limit,
+					path: searchPath,
+					backgroundIndex: "already-running",
+					activity: { kind: "indexing", source: "internal", message: "The Pi extension already has an active CocoIndex indexing job." },
+				});
+			}
+
+			const activity = await getCocoIndexActivity(root, { signal, timeoutMs: SEARCH_STATUS_TIMEOUT_MS });
+			if (activity.kind === "indexing") {
+				return makeIndexingRetryResult({ root, query, limit, path: searchPath, backgroundIndex: "already-running", activity });
+			}
+			if (activity.kind === "unknown") {
+				return makeIndexingRetryResult({
+					root,
+					query,
+					limit,
+					path: searchPath,
+					backgroundIndex: "not-started",
+					activity,
+					message: makeUnknownActivityRetryMessage({ root, query, limit, path: searchPath, activity }),
+				});
+			}
+
 			const args = ["search", "--limit", String(limit)];
 			if (searchPath) args.push("--path", searchPath);
 			args.push(query);
@@ -380,8 +508,13 @@ export default function cocoindexExtension(pi: ExtensionAPI): void {
 				const run = await runCcc(root, args, { signal, timeoutMs: SEARCH_TIMEOUT_MS });
 				const matches = parseCccSearchResults(run.stdout);
 				const combined = combineOutputs(run.stdout, run.stderr) || "No results.";
+				const postSearchIndexState = runtime.getState(root);
+				if (postSearchIndexState.status !== "running") {
+					const refresh = runtime.startIndex(root, "search", { force: false, notify: indexNotifier });
+					backgroundIndex = refresh.status;
+				}
 				const indexState = runtime.getState(root);
-				const note = formatSearchIndexNote(start.status, indexState);
+				const note = formatSearchIndexNote(backgroundIndex, indexState);
 				const truncated = truncateText(`${combined}${note}`, "head");
 				return {
 					content: [{ type: "text" as const, text: truncated.text }],
@@ -392,7 +525,8 @@ export default function cocoindexExtension(pi: ExtensionAPI): void {
 						query,
 						limit,
 						path: searchPath,
-						backgroundIndex: start.status,
+						status: "ok",
+						backgroundIndex,
 						truncated: truncated.truncated,
 						matches,
 					} satisfies SearchDetails,
@@ -595,6 +729,54 @@ function hasGlobalSettings(): boolean {
 	return existsSync(path.join(os.homedir(), ".cocoindex_code", "global_settings.yml"));
 }
 
+async function getCocoIndexActivity(root: string, options: RunOptions): Promise<CocoIndexActivity> {
+	try {
+		const run = await runCcc(root, ["status"], options);
+		const rawStatus = combineOutputs(run.stdout, run.stderr);
+		const parsed = parseCccStatusActivity(rawStatus);
+		if (parsed === "indexing") {
+			return {
+				kind: "indexing",
+				source: "ccc-status",
+				message: "`ccc status` reports indexing is in progress.",
+				rawStatus,
+			};
+		}
+		if (parsed === "idle") return { kind: "idle", source: "ccc-status", rawStatus };
+		return {
+			kind: "unknown",
+			source: "ccc-status",
+			reason: "parse-error",
+			message: "`ccc status` returned output the extension could not classify as idle or indexing.",
+			rawStatus,
+		};
+	} catch (error) {
+		if (isCancelledError(error, options.signal)) throw error;
+		if (isMissingCcc(error)) throw error;
+		return {
+			kind: "unknown",
+			source: "ccc-status",
+			reason: classifyStatusFailure(error),
+			message: errorToMessage(error),
+			rawStatus: error instanceof CccError ? error.combinedOutput : undefined,
+		};
+	}
+}
+
+function parseCccStatusActivity(rawStatus: string): "indexing" | "idle" | "unknown" {
+	if (/Indexing\s+in\s+progress/i.test(rawStatus)) return "indexing";
+	// Fail closed: only classify status as idle when CocoIndex reports usable index stats.
+	// A `Project:` line alone can appear alongside future active/error states we do not parse yet.
+	if (/Index\s+stats:/i.test(rawStatus)) return "idle";
+	return "unknown";
+}
+
+function classifyStatusFailure(error: unknown): CocoIndexActivityUnknownReason {
+	if (isCccTimeoutError(error)) return "timeout";
+	if (error instanceof CccError && error.code === "ENOENT") return "spawn-error";
+	return "exit-error";
+}
+
 async function runCcc(cwd: string, args: string[], options: RunOptions): Promise<RunResult> {
 	const command = formatCommand(args);
 	try {
@@ -607,13 +789,20 @@ async function runCcc(cwd: string, args: string[], options: RunOptions): Promise
 		});
 		return { command, cwd, stdout: String(result.stdout ?? ""), stderr: String(result.stderr ?? "") };
 	} catch (error: unknown) {
-		const err = error as NodeJS.ErrnoException & { stdout?: unknown; stderr?: unknown; code?: unknown };
+		const err = error as NodeJS.ErrnoException & { stdout?: unknown; stderr?: unknown; code?: unknown; signal?: unknown; killed?: boolean };
+		const cancelled = isRawCancellation(err, options.signal);
+		const timedOut = !cancelled && isRawTimeout(err);
 		throw new CccError(renderRawFailure(err, command), {
 			command,
 			cwd,
 			stdout: String(err.stdout ?? ""),
 			stderr: String(err.stderr ?? err.message ?? ""),
 			code: err.code,
+			signal: err.signal,
+			killed: err.killed,
+			timedOut,
+			cancelled,
+			causeName: err.name,
 		});
 	}
 }
@@ -691,7 +880,7 @@ function renderCommandFailure(error: unknown): string {
 
 function renderRawFailure(error: { code?: unknown; name?: string; stdout?: unknown; stderr?: unknown; message?: string }, command: string): string {
 	if (error.code === "ENOENT") return missingCccMessage();
-	if (error.name === "AbortError") return `Cancelled: ${command}`;
+	if (error.name === "AbortError" || error.code === "ABORT_ERR") return `Cancelled: ${command}`;
 	const combined = combineOutputs(String(error.stdout ?? ""), String(error.stderr ?? error.message ?? ""));
 	const truncated = truncateText(combined || String(error.message ?? "Unknown ccc error."), "tail").text;
 	const exitInfo = typeof error.code === "number" ? ` (exit ${error.code})` : "";
@@ -711,6 +900,28 @@ function isMissingCcc(error: unknown): boolean {
 	return error instanceof CccError && error.code === "ENOENT";
 }
 
+function isCancelledError(error: unknown, signal?: AbortSignal): boolean {
+	if (signal?.aborted) return true;
+	if (error instanceof CccError) return error.cancelled;
+	if (error instanceof Error && error.name === "AbortError") return true;
+	const maybe = error as { code?: unknown; name?: unknown } | undefined;
+	return maybe?.code === "ABORT_ERR" || maybe?.name === "AbortError";
+}
+
+function isCccTimeoutError(error: unknown): boolean {
+	if (error instanceof CccError) return error.timedOut;
+	return isRawTimeout(error as { message?: unknown; signal?: unknown; killed?: boolean } | undefined);
+}
+
+function isRawCancellation(error: { code?: unknown; name?: unknown } | undefined, signal?: AbortSignal): boolean {
+	return Boolean(signal?.aborted || error?.name === "AbortError" || error?.code === "ABORT_ERR");
+}
+
+function isRawTimeout(error: { message?: unknown; signal?: unknown; killed?: boolean } | undefined): boolean {
+	const message = typeof error?.message === "string" ? error.message : "";
+	return Boolean((error?.killed === true && error.signal === "SIGTERM") || /timed?\s*out|timeout/i.test(message));
+}
+
 function isUninitializedError(text: string): boolean {
 	return /Not in an initialized project directory/i.test(text);
 }
@@ -726,7 +937,7 @@ function formatCommandOutput(title: string, run: RunResult, mode: TruncationMode
 	return [`── ${title} ──`, `cwd: ${run.cwd}`, `command: ${run.command}`, "", body, ...notes.map((note) => `\n${note}`)].join("\n").trim();
 }
 
-function formatSearchIndexNote(startStatus: "started" | "already-running" | "skipped-cooldown" | "disposed", state: ProjectIndexState): string {
+function formatSearchIndexNote(startStatus: SearchDetails["backgroundIndex"], state: ProjectIndexState): string {
 	if (state.status === "running") {
 		return "\n\nNote: CocoIndex background indexing is currently running; results may be slightly stale.";
 	}

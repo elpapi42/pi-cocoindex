@@ -83,9 +83,9 @@ search({
 })
 ```
 
-`search` runs `ccc search --limit N [--path PATH] QUERY` from the resolved project root. It does **not** run `--refresh`; indexing is managed in the background so searches stay fast. If background indexing is running or unhealthy, results include a note that they may be stale. Omit `path` unless the user names an area or broad results are noisy. Files like `src/index.ts` work directly; for recursive directory search, use glob form such as `src/**`, not plain `src` or `src/`.
+`search` runs `ccc search --limit N [--path PATH] QUERY` from the resolved project root. It does **not** run `--refresh`; indexing is managed in the background so searches stay fast. Before searching, the tool performs a short `ccc status` preflight so it does not rely only on the extension's in-memory indexing state. If CocoIndex is actively indexing — or if status cannot confirm quickly that the index is idle — `search` returns immediately with a retry-later message so the agent can inspect files with other available tools while CocoIndex settles. Otherwise, `search` uses the existing on-disk index immediately and then starts a deduped background refresh for future searches. If indexing is unhealthy but not actively running, results may include a stale-index note. Omit `path` unless the user names an area or broad results are noisy. Files like `src/index.ts` work directly; for recursive directory search, use glob form such as `src/**`, not plain `src` or `src/`.
 
-In Pi's TUI, the tool call renders as `search "<query>"`. The collapsed result body renders a compact bulleted summary with relative path, line range, language, and CocoIndex score; the expanded view keeps the same bulleted match format for all parsed matches and adds search metadata such as query, path filter, project root, background index state, and truncation status. The model still receives the full CocoIndex snippets in the tool content.
+In Pi's TUI, the tool call renders as `search "<query>"`. The collapsed result body renders a compact bulleted summary with relative path, line range, language, and CocoIndex score; the expanded view keeps the same bulleted match format for all parsed matches and adds search metadata such as query, path filter, project root, background index state, and truncation status. If a search is deferred because indexing is active or status is unknown, the TUI shows the retry-later message instead of an empty result list. The model still receives the full CocoIndex snippets in the tool content when a search runs.
 
 `path` is project-relative. Leading `@` is stripped for agent convenience, while absolute paths and `..` traversal are rejected. Directory-like filters are not normalized automatically in v1; pass an explicit glob such as `src/**` when you want everything under a directory.
 
@@ -99,7 +99,7 @@ The extension treats the git repository as the product boundary. It resolves the
 
 On session start, if the project is already initialized, the extension starts a deduped background `ccc index`. It does not auto-run `ccc init` from the search tool.
 
-The extension is deliberately chatty while indexing: Pi notifications announce background index start, already-running/cooldown decisions, completion with elapsed time, failures with a short diagnostic hint, and reset-time aborts. If that becomes too noisy in practice, this is the first behavior to tune down.
+The extension is deliberately chatty while indexing: Pi notifications announce background index start, already-running/cooldown decisions, completion with elapsed time, failures with a short diagnostic hint, and reset-time aborts. Agent-facing searches use a short status preflight for fast safety; `/cc-status` remains the longer diagnostic command when you need full CocoIndex status output. If notifications become too noisy in practice, this is the first behavior to tune down.
 
 ## Human commands
 
