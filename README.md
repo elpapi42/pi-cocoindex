@@ -85,6 +85,8 @@ search({
 
 `search` runs `ccc search --limit N [--path PATH] QUERY` from the resolved project root. It does **not** run `--refresh`; indexing is managed in the background so searches stay fast. If background indexing is running or unhealthy, results include a note that they may be stale.
 
+In Pi's TUI, the tool call renders as `search "<query>"` and the result body renders a compact summary with relative path, line range, language, and CocoIndex score. The model still receives the full CocoIndex snippets in the tool content.
+
 `path` is project-relative. Leading `@` is stripped for agent convenience, while absolute paths and `..` traversal are rejected.
 
 ## Project root and indexing

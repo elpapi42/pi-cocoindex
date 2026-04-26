@@ -5,6 +5,7 @@ import path from "node:path";
 import { promisify } from "node:util";
 import { Type } from "@mariozechner/pi-ai";
 import type { ExtensionAPI } from "@mariozechner/pi-coding-agent";
+import { Text } from "@mariozechner/pi-tui";
 
 const execFileAsync = promisify(execFile);
 
@@ -14,6 +15,9 @@ const MAX_OUTPUT_LINES = 2000;
 const DEFAULT_LIMIT = 10;
 const MAX_LIMIT = 25;
 const FAILED_INDEX_COOLDOWN_MS = 5 * 60_000;
+const COLLAPSED_RESULT_COUNT = 8;
+const MAX_QUERY_PREVIEW_CHARS = 96;
+const MAX_PATH_PREVIEW_CHARS = 72;
 
 const SEARCH_TIMEOUT_MS = 60_000;
 const STATUS_TIMEOUT_MS = 30_000;
@@ -46,6 +50,27 @@ interface RunResult {
 interface RunOptions {
 	signal?: AbortSignal;
 	timeoutMs: number;
+}
+
+interface SearchMatch {
+	rank: number;
+	score: number;
+	path: string;
+	startLine?: number;
+	endLine?: number;
+	language?: string;
+}
+
+interface SearchDetails {
+	command: string;
+	cwd: string;
+	projectRoot: string;
+	query: string;
+	limit: number;
+	path?: string;
+	backgroundIndex: "started" | "already-running" | "skipped-cooldown" | "disposed";
+	truncated: boolean;
+	matches: SearchMatch[];
 }
 
 type NotifyLevel = "info" | "warning" | "error";
@@ -228,6 +253,64 @@ const SearchParams = Type.Object({
 	path: Type.Optional(Type.String({ description: "Optional project-relative file, directory, or glob to narrow semantic search. Omit unless the user named a specific area." })),
 });
 
+
+function renderSearchCall(args: { query?: string; path?: string }, theme: any) {
+	const fg = theme.fg.bind(theme);
+	const query = previewInline(args.query || "", MAX_QUERY_PREVIEW_CHARS) || "...";
+	const searchPath = previewInline(args.path || "", MAX_PATH_PREVIEW_CHARS);
+	const pathSuffix = searchPath ? ` ${fg("dim", `in ${searchPath}`)}` : "";
+	return new Text(`${fg("toolTitle", theme.bold("search"))} ${fg("accent", JSON.stringify(query))}${pathSuffix}`, 0, 0);
+}
+
+function renderSearchResult(toolResult: any, { expanded, isPartial }: { expanded: boolean; isPartial?: boolean }, theme: any, context?: { isError?: boolean }) {
+	const fg = theme.fg.bind(theme);
+	if (isPartial) return new Text(fg("muted", "searching..."), 0, 0);
+
+	if (context?.isError || toolResult?.isError) {
+		return new Text(fg("error", getToolResultText(toolResult) || "Search failed."), 0, 0);
+	}
+
+	const matches = getSearchMatches(toolResult);
+	if (!matches.length) return new Text(fg("muted", "No results"), 0, 0);
+
+	const shown = expanded ? matches : matches.slice(0, COLLAPSED_RESULT_COUNT);
+	const lines = shown.map((match) => {
+		const score = Number.isFinite(match.score) ? match.score.toFixed(3) : "?";
+		const location = formatSearchMatchLocation(match);
+		const language = match.language ? ` ${match.language}` : "";
+		return `${fg("dim", `${match.rank}.`)} ${fg("toolOutput", location)}${fg("dim", `${language} ${score}`)}`;
+	});
+	if (!expanded && matches.length > shown.length) {
+		lines.push(fg("muted", `... ${matches.length - shown.length} more`));
+	}
+	return new Text(lines.join("\n"), 0, 0);
+}
+
+function getToolResultText(toolResult: any): string {
+	const content = toolResult?.content;
+	if (!Array.isArray(content)) return "";
+	return content
+		.filter((item) => item?.type === "text" && typeof item.text === "string")
+		.map((item) => item.text.trim())
+		.filter(Boolean)
+		.join("\n\n");
+}
+
+function formatSearchMatchLocation(match: SearchMatch): string {
+	if (match.startLine === undefined) return match.path;
+	const range = match.endLine !== undefined && match.endLine !== match.startLine ? `${match.startLine}-${match.endLine}` : String(match.startLine);
+	return `${match.path}:${range}`;
+}
+
+function getSearchMatches(toolResult: any): SearchMatch[] {
+	const matches = toolResult?.details?.matches;
+	return Array.isArray(matches) ? matches.filter(isSearchMatch) : [];
+}
+
+function isSearchMatch(value: any): value is SearchMatch {
+	return value && typeof value.rank === "number" && typeof value.score === "number" && typeof value.path === "string";
+}
+
 export default function cocoindexExtension(pi: ExtensionAPI): void {
 	const runtime = new CocoIndexRuntime();
 
@@ -241,6 +324,8 @@ export default function cocoindexExtension(pi: ExtensionAPI): void {
 			"For search.path, use a project-relative path or glob only when the user explicitly names an area or a broader search was too noisy.",
 		],
 		parameters: SearchParams,
+		renderCall: renderSearchCall,
+		renderResult: renderSearchResult,
 		async execute(_toolCallId, params, signal, _onUpdate, ctx) {
 			const root = await resolveProjectRoot(ctx.cwd);
 			const query = params.query.trim();
@@ -260,6 +345,7 @@ export default function cocoindexExtension(pi: ExtensionAPI): void {
 
 			try {
 				const run = await runCcc(root, args, { signal, timeoutMs: SEARCH_TIMEOUT_MS });
+				const matches = parseCccSearchResults(run.stdout);
 				const combined = combineOutputs(run.stdout, run.stderr) || "No results.";
 				const indexState = runtime.getState(root);
 				const note = formatSearchIndexNote(start.status, indexState);
@@ -270,11 +356,13 @@ export default function cocoindexExtension(pi: ExtensionAPI): void {
 						command: run.command,
 						cwd: run.cwd,
 						projectRoot: root,
+						query,
 						limit,
 						path: searchPath,
 						backgroundIndex: start.status,
 						truncated: truncated.truncated,
-					},
+						matches,
+					} satisfies SearchDetails,
 				};
 			} catch (error) {
 				throw new Error(renderToolFailure(error, root));
@@ -390,6 +478,44 @@ export default function cocoindexExtension(pi: ExtensionAPI): void {
 	pi.on("session_shutdown", () => {
 		runtime.shutdown();
 	});
+}
+
+
+function parseCccSearchResults(output: string): SearchMatch[] {
+	const lines = output.split(/\r?\n/);
+	const matches: SearchMatch[] = [];
+	let pending: { rank: number; score: number } | undefined;
+
+	for (const line of lines) {
+		const resultMatch = line.match(/^--- Result\s+(\d+)\s+\(score:\s*([^\)]+)\)\s+---$/);
+		if (resultMatch) {
+			const rank = Number(resultMatch[1]);
+			const score = Number(resultMatch[2]);
+			pending = Number.isFinite(rank) && Number.isFinite(score) ? { rank, score } : undefined;
+			continue;
+		}
+
+		if (!pending) continue;
+		const fileMatch = line.match(/^File:\s+(.+?)(?:\s+\[([^\]]+)\])?$/);
+		if (!fileMatch) continue;
+
+		const pathAndRange = fileMatch[1].trim();
+		const rangeMatch = pathAndRange.match(/^(.+):(\d+)(?:-(\d+))?$/);
+		const startLine = rangeMatch ? Number(rangeMatch[2]) : undefined;
+		const endLine = rangeMatch ? Number(rangeMatch[3] ?? rangeMatch[2]) : undefined;
+
+		matches.push({
+			rank: pending.rank,
+			score: pending.score,
+			path: rangeMatch ? rangeMatch[1] : pathAndRange,
+			...(startLine !== undefined ? { startLine } : {}),
+			...(endLine !== undefined ? { endLine } : {}),
+			...(fileMatch[2] ? { language: fileMatch[2].trim() } : {}),
+		});
+		pending = undefined;
+	}
+
+	return matches;
 }
 
 async function resolveProjectRoot(cwd: string): Promise<string> {
@@ -621,6 +747,13 @@ function canConfirm(ctx: ConfirmTarget): ctx is ConfirmTarget & { ui: NonNullabl
 	} catch {
 		return false;
 	}
+}
+
+
+function previewInline(value: string, maxChars: number): string {
+	const normalized = value.replace(/\s+/g, " ").trim();
+	if (normalized.length <= maxChars) return normalized;
+	return `${normalized.slice(0, Math.max(0, maxChars - 1))}…`;
 }
 
 function shellQuote(value: string): string {
