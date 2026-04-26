@@ -83,7 +83,7 @@ search({
 })
 ```
 
-`search` runs `ccc search --limit N [--path PATH] QUERY` from the resolved project root. It does **not** run `--refresh`; indexing is managed in the background so searches stay fast. Before searching, the tool performs a short `ccc status` preflight so it does not rely only on the extension's in-memory indexing state. If CocoIndex is actively indexing — or if status cannot confirm quickly that the index is idle — `search` returns immediately with a retry-later message so the agent can inspect files with other available tools while CocoIndex settles. Otherwise, `search` uses the existing on-disk index immediately and then starts a deduped background refresh for future searches. If indexing is unhealthy but not actively running, results may include a stale-index note. Omit `path` unless the user names an area or broad results are noisy. Files like `src/index.ts` work directly; for recursive directory search, use glob form such as `src/**`, not plain `src` or `src/`.
+`search` runs `ccc search --limit N [--path PATH] QUERY` from the resolved project root. It does **not** run `--refresh` and does not request reindexing after a successful search; search stays a pure lookup so multiple sequential searches are not interrupted by automatic refreshes. Before searching, the tool performs a short `ccc status` preflight so it does not rely only on the extension's in-memory indexing state. If CocoIndex is actively indexing — or if status cannot confirm quickly that the index is idle — `search` returns immediately with a retry-later message so the agent can inspect files with other available tools while CocoIndex settles. If indexing is unhealthy but not actively running, results may include a stale-index note. Omit `path` unless the user names an area or broad results are noisy. Files like `src/index.ts` work directly; for recursive directory search, use glob form such as `src/**`, not plain `src` or `src/`.
 
 In Pi's TUI, the tool call renders as `search "<query>"`. The collapsed result body renders a compact bulleted summary with relative path, line range, language, and CocoIndex score; the expanded view keeps the same bulleted match format for all parsed matches and adds search metadata such as query, path filter, project root, background index state, and truncation status. If a search is deferred because indexing is active or status is unknown, the TUI shows the retry-later message instead of an empty result list. The model still receives the full CocoIndex snippets in the tool content when a search runs.
 
@@ -97,9 +97,9 @@ The extension treats the git repository as the product boundary. It resolves the
 2. nearest initialized CocoIndex ancestor between Pi's current directory and that git root, if one exists
 3. Pi's current working directory, or an initialized ancestor above it only when no git root exists
 
-On session start, if the project is already initialized, the extension starts a deduped background `ccc index`. It does not auto-run `ccc init` from the search tool.
+Automatic refresh is intentionally simple: session start and successful searches do not trigger indexing. When the agent finishes a run, the `agent_end` hook checks CocoIndex status and starts `ccc index` immediately in the background only when status is idle. If CocoIndex is already indexing or status is unknown, the auto-index is skipped with a notification. The extension does not auto-run `ccc init` from the search tool.
 
-The extension is deliberately chatty while indexing: Pi notifications announce background index start, already-running/cooldown decisions, completion with elapsed time, failures with a short diagnostic hint, and reset-time aborts. Agent-facing searches use a short status preflight for fast safety; `/cc-status` remains the longer diagnostic command when you need full CocoIndex status output. If notifications become too noisy in practice, this is the first behavior to tune down.
+The extension is deliberately chatty while indexing: Pi notifications announce background index start, already-running/cooldown decisions, completion with elapsed time, failures with a short diagnostic hint, skipped agent-end auto-index attempts, and reset-time aborts. Agent-facing searches use a short status preflight for fast safety; `/cc-status` remains the longer diagnostic command when you need full CocoIndex status output. If notifications become too noisy in practice, this is the first behavior to tune down.
 
 ## Human commands
 
@@ -113,16 +113,16 @@ Lifecycle/debug operations are slash commands for the human, not tools for the a
 /cc-reset [--yes]
 ```
 
-- `/cc-init` runs `ccc init`, then starts background indexing. If CocoIndex global settings do not exist yet, the command requires `--litellm-model MODEL` for noninteractive setup; otherwise run `ccc init` once in a terminal first.
+- `/cc-init` runs `ccc init`, then starts background indexing. If the project is already initialized, it first confirms CocoIndex status is idle; if CocoIndex is actively indexing or status is unknown, init is not started. If CocoIndex global settings do not exist yet, the command requires `--litellm-model MODEL` for noninteractive setup; otherwise run `ccc init` once in a terminal first.
 - `/cc-status` shows dense extension state — initialized status, current index state, reason, start/finish times, last success/failure, retry cooldown, and last error — plus raw `ccc status` output.
-- `/cc-reindex` starts/dedupes background `ccc index`.
+- `/cc-reindex` starts/dedupes background `ccc index` after confirming CocoIndex status is idle; it is not started while external indexing is active or status is unknown.
 - `/cc-doctor` runs `ccc doctor`.
-- `/cc-reset` confirms unless `--yes`, runs `ccc reset -f`, then starts background indexing if the project remains initialized.
+- `/cc-reset` confirms unless `--yes`, aborts extension-owned indexing, confirms CocoIndex status is idle, runs `ccc reset -f`, then starts background indexing if the project remains initialized. It refuses to reset while external indexing is active or status is unknown.
 
 ## Notes
 
 - First-time CocoIndex setup may require embedding configuration. To avoid hanging Pi on an interactive prompt, `/cc-init` will not run before global settings exist unless you provide `/cc-init --litellm-model <model>`.
-- Background index failures are throttled for five minutes so every search does not repeatedly spawn a failing index process. `/cc-reindex` bypasses that cooldown. Use `/cc-status` whenever chatty lifecycle notifications indicate a failed or stale index.
+- Background index failures are throttled for five minutes so automatic indexing does not repeatedly spawn a failing index process. `/cc-reindex` bypasses that cooldown. Use `/cc-status` whenever chatty lifecycle notifications indicate a failed or stale index.
 - CocoIndex settings and index state live outside this npm package and should not be committed from projects that use it.
 
 ## License

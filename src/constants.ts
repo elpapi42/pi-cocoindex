@@ -13,3 +13,5 @@ export const SEARCH_STATUS_TIMEOUT_MS = 1_500;
 export const STATUS_TIMEOUT_MS = 30_000;
 export const LONG_COMMAND_TIMEOUT_MS = 5 * 60_000;
 export const INDEX_TIMEOUT_MS = 30 * 60_000;
+
+export const AUTO_INDEX_STATUS_TIMEOUT_MS = 1_500;

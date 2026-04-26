@@ -2,7 +2,6 @@ import type { ExtensionAPI } from "@mariozechner/pi-coding-agent";
 import { getCocoIndexActivity } from "../activity.js";
 import { renderToolFailure, runCcc } from "../ccc.js";
 import { DEFAULT_LIMIT, MAX_LIMIT, SEARCH_STATUS_TIMEOUT_MS, SEARCH_TIMEOUT_MS } from "../constants.js";
-import { makeLifecycleNotifier } from "../notify.js";
 import { combineOutputs, formatSearchIndexNote, truncateText } from "../output.js";
 import { isInitialized, resolveProjectRoot } from "../project.js";
 import { CocoIndexRuntime } from "../runtime.js";
@@ -38,7 +37,6 @@ export function registerSearchTool(pi: ExtensionAPI, runtime: CocoIndexRuntime):
 				throw new Error(`CocoIndex is not initialized for ${root}. Run /cc-init to create CocoIndex settings and start background indexing, then retry search.`);
 			}
 
-			const indexNotifier = makeLifecycleNotifier(ctx);
 			const currentIndexState = runtime.getState(root);
 			let backgroundIndex: SearchDetails["backgroundIndex"] = "not-started";
 			if (currentIndexState.status === "running") {
@@ -76,11 +74,6 @@ export function registerSearchTool(pi: ExtensionAPI, runtime: CocoIndexRuntime):
 				const run = await runCcc(root, args, { signal, timeoutMs: SEARCH_TIMEOUT_MS });
 				const matches = parseCccSearchResults(run.stdout);
 				const combined = combineOutputs(run.stdout, run.stderr) || "No results.";
-				const postSearchIndexState = runtime.getState(root);
-				if (postSearchIndexState.status !== "running") {
-					const refresh = runtime.startIndex(root, "search", { force: false, notify: indexNotifier });
-					backgroundIndex = refresh.status;
-				}
 				const indexState = runtime.getState(root);
 				const note = formatSearchIndexNote(backgroundIndex, indexState);
 				const truncated = truncateText(`${combined}${note}`, "head");
