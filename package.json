@@ -1,6 +1,6 @@
 {
   "name": "pi-cocoindex",
-  "version": "0.1.0",
+  "version": "1.0.0",
   "description": "Pi extension that exposes CocoIndex Code as a simple semantic search tool.",
   "type": "module",
   "license": "MIT",
