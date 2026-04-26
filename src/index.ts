@@ -31,6 +31,7 @@ interface ProjectIndexState {
 	reason?: string;
 	startedAt?: number;
 	finishedAt?: number;
+	lastSucceededAt?: number;
 	lastError?: string;
 	lastFailureAt?: number;
 }
@@ -45,6 +46,27 @@ interface RunResult {
 interface RunOptions {
 	signal?: AbortSignal;
 	timeoutMs: number;
+}
+
+type NotifyLevel = "info" | "warning" | "error";
+type LifecycleNotifier = (message: string, level?: NotifyLevel) => void;
+
+interface NotifyTarget {
+	hasUI?: boolean;
+	ui?: {
+		notify(message: string, level?: NotifyLevel): void;
+	};
+}
+
+interface ConfirmTarget extends NotifyTarget {
+	ui?: NotifyTarget["ui"] & {
+		confirm(title: string, message: string): Promise<boolean>;
+	};
+}
+
+interface StartIndexOptions {
+	force?: boolean;
+	notify?: LifecycleNotifier;
 }
 
 class CccError extends Error {
@@ -84,22 +106,37 @@ class CocoIndexRuntime {
 
 	formatState(root: string): string {
 		const state = this.getState(root);
-		const lines = [`Extension state for ${root}:`, `- index: ${state.status}`];
-		if (state.reason) lines.push(`- reason: ${state.reason}`);
+		const cooldownRemaining = getCooldownRemainingMs(state);
+		const lines = [
+			`CocoIndex status for ${root}:`,
+			`- initialized: ${isInitialized(root) ? "yes" : "no"}`,
+			`- extension index: ${state.status}`,
+		];
+		if (state.reason) lines.push(`- current/last reason: ${state.reason}`);
 		if (state.startedAt) lines.push(`- started: ${formatAge(state.startedAt)} ago`);
 		if (state.finishedAt) lines.push(`- finished: ${formatAge(state.finishedAt)} ago`);
+		if (state.lastSucceededAt) lines.push(`- last success: ${formatAge(state.lastSucceededAt)} ago`);
 		if (state.lastFailureAt) lines.push(`- last failure: ${formatAge(state.lastFailureAt)} ago`);
+		if (cooldownRemaining > 0) lines.push(`- retry cooldown: ${formatDurationMs(cooldownRemaining)} remaining`);
 		if (state.lastError) lines.push(`- last error: ${truncateText(state.lastError, "tail", 2_000, 80).text}`);
 		return lines.join("\n");
 	}
 
-	startIndex(root: string, reason: string, options: { force?: boolean } = {}): { status: "started" | "already-running" | "skipped-cooldown" | "disposed"; state: ProjectIndexState } {
+	startIndex(root: string, reason: string, options: StartIndexOptions = {}): { status: "started" | "already-running" | "skipped-cooldown" | "disposed"; state: ProjectIndexState } {
 		const state = this.getState(root);
-		if (this.disposed) return { status: "disposed", state };
-		if (state.status === "running" && state.promise) return { status: "already-running", state };
+		if (this.disposed) {
+			emitLifecycle(options.notify, `index not started (${reason}) for ${root}: extension is shutting down`, "warning");
+			return { status: "disposed", state };
+		}
+		if (state.status === "running" && state.promise) {
+			emitLifecycle(options.notify, `index already running for ${root} (current reason: ${state.reason ?? "unknown"}; requested: ${reason})`, "info");
+			return { status: "already-running", state };
+		}
 
 		const now = Date.now();
-		if (!options.force && state.lastFailureAt && now - state.lastFailureAt < FAILED_INDEX_COOLDOWN_MS) {
+		const cooldownRemaining = getCooldownRemainingMs(state, now);
+		if (!options.force && cooldownRemaining > 0) {
+			emitLifecycle(options.notify, `index not restarted for ${root} (${reason}): last failure is in cooldown for ${formatDurationMs(cooldownRemaining)}. Use /cc-reindex to force.`, "warning");
 			return { status: "skipped-cooldown", state };
 		}
 
@@ -110,38 +147,53 @@ class CocoIndexRuntime {
 		state.startedAt = now;
 		state.finishedAt = undefined;
 		state.lastError = undefined;
+		emitLifecycle(options.notify, `index started for ${root} (${reason})`, "info");
 
 		let promise!: Promise<void>;
 		promise = (async () => {
+			let runError: unknown;
 			try {
 				await runCcc(root, ["index"], { signal: controller.signal, timeoutMs: INDEX_TIMEOUT_MS });
-				if (this.disposed || this.getState(root).promise !== promise) return;
+			} catch (error) {
+				runError = error;
+			}
+
+			if (this.disposed || this.getState(root).promise !== promise) return;
+
+			const finishedAt = Date.now();
+			if (runError === undefined) {
 				Object.assign(state, {
 					status: "succeeded" as const,
 					promise: undefined,
 					controller: undefined,
-					finishedAt: Date.now(),
+					finishedAt,
+					lastSucceededAt: finishedAt,
 					lastError: undefined,
 					lastFailureAt: undefined,
 				});
-			} catch (error) {
-				if (this.disposed || this.getState(root).promise !== promise) return;
-				Object.assign(state, {
-					status: "failed" as const,
-					promise: undefined,
-					controller: undefined,
-					finishedAt: Date.now(),
-					lastError: errorToMessage(error),
-					lastFailureAt: Date.now(),
-				});
+				emitLifecycle(options.notify, `index completed for ${root} (${reason}) in ${formatDurationMs(finishedAt - now)}`, "info");
+				return;
 			}
+
+			const message = errorToMessage(runError);
+			Object.assign(state, {
+				status: "failed" as const,
+				promise: undefined,
+				controller: undefined,
+				finishedAt,
+				lastError: message,
+				lastFailureAt: finishedAt,
+			});
+			emitLifecycle(options.notify, `index failed for ${root} (${reason}) after ${formatDurationMs(finishedAt - now)}: ${truncateText(message, "tail", 1_500, 40).text}\nRun /cc-status for state or /cc-doctor for diagnostics.`, "warning");
 		})();
 		state.promise = promise;
 		return { status: "started", state };
 	}
 
-	abortIndex(root: string): void {
+	abortIndex(root: string, reason = "abort", notify?: LifecycleNotifier): void {
 		const state = this.getState(root);
+		const wasRunning = state.status === "running";
+		const startedAt = state.startedAt;
 		state.controller?.abort();
 		state.promise = undefined;
 		state.controller = undefined;
@@ -149,6 +201,9 @@ class CocoIndexRuntime {
 		state.reason = undefined;
 		state.startedAt = undefined;
 		state.finishedAt = undefined;
+		if (wasRunning) {
+			emitLifecycle(notify, `index aborted for ${root} (${reason}${startedAt ? ` after ${formatDurationMs(Date.now() - startedAt)}` : ""})`, "warning");
+		}
 	}
 
 	clear(root: string): void {
@@ -197,7 +252,8 @@ export default function cocoindexExtension(pi: ExtensionAPI): void {
 				throw new Error(`CocoIndex is not initialized for ${root}. Run /cc-init to create CocoIndex settings and start background indexing, then retry search.`);
 			}
 
-			const start = runtime.startIndex(root, "search", { force: false });
+			const indexNotifier = makeLifecycleNotifier(ctx);
+			const start = runtime.startIndex(root, "search", { force: false, notify: indexNotifier });
 			const args = ["search", "--limit", String(limit)];
 			if (searchPath) args.push("--path", searchPath);
 			args.push(query);
@@ -247,7 +303,7 @@ export default function cocoindexExtension(pi: ExtensionAPI): void {
 
 			try {
 				const run = await runCcc(root, ["init", ...parsed.args], { timeoutMs: LONG_COMMAND_TIMEOUT_MS });
-				const start = runtime.startIndex(root, "cc-init", { force: true });
+				const start = runtime.startIndex(root, "cc-init", { force: true, notify: makeLifecycleNotifier(ctx) });
 				const output = formatCommandOutput("CocoIndex init", run, "head", [
 					formatIndexStart(start.status, root),
 				]);
@@ -277,7 +333,7 @@ export default function cocoindexExtension(pi: ExtensionAPI): void {
 		handler: async (_args, ctx) => {
 			const root = await resolveProjectRoot(ctx.cwd);
 			if (!isInitialized(root)) return notify(ctx, `CocoIndex is not initialized for ${root}. Run /cc-init first.`, "warning");
-			const start = runtime.startIndex(root, "cc-reindex", { force: true });
+			const start = runtime.startIndex(root, "cc-reindex", { force: true, notify: makeLifecycleNotifier(ctx) });
 			notify(ctx, formatIndexStart(start.status, root), start.status === "started" || start.status === "already-running" ? "info" : "warning");
 		},
 	});
@@ -303,17 +359,20 @@ export default function cocoindexExtension(pi: ExtensionAPI): void {
 			if (!parsed.ok) return notify(ctx, parsed.message, "error");
 
 			if (!parsed.yes) {
+				if (!canConfirm(ctx)) {
+					return notifyLifecycle(ctx, "reset requires confirmation. Use /cc-reset --yes in non-interactive mode.", "warning");
+				}
 				const confirmed = await ctx.ui.confirm("Reset CocoIndex?", `This will reset CocoIndex index data for:\n${root}\n\nSettings are kept. The extension will start background reindexing afterward.`);
-				if (!confirmed) return notify(ctx, "CocoIndex reset cancelled.", "info");
+				if (!confirmed) return notifyLifecycle(ctx, "reset cancelled", "info");
 			}
 
 			try {
-				runtime.abortIndex(root);
+				runtime.abortIndex(root, "cc-reset", makeLifecycleNotifier(ctx));
 				const run = await runCcc(root, ["reset", "-f"], { timeoutMs: LONG_COMMAND_TIMEOUT_MS });
 				runtime.clear(root);
 				const notes = ["CocoIndex reset completed."];
 				if (isInitialized(root)) {
-					const start = runtime.startIndex(root, "cc-reset", { force: true });
+					const start = runtime.startIndex(root, "cc-reset", { force: true, notify: makeLifecycleNotifier(ctx) });
 					notes.push(formatIndexStart(start.status, root));
 				}
 				notify(ctx, formatCommandOutput("ccc reset", run, "tail", notes), "info");
@@ -325,7 +384,7 @@ export default function cocoindexExtension(pi: ExtensionAPI): void {
 
 	pi.on("session_start", async (_event, ctx) => {
 		const root = await resolveProjectRoot(ctx.cwd);
-		if (isInitialized(root)) runtime.startIndex(root, "session_start", { force: false });
+		if (isInitialized(root)) runtime.startIndex(root, "session_start", { force: false, notify: makeLifecycleNotifier(ctx) });
 	});
 
 	pi.on("session_shutdown", () => {
@@ -531,8 +590,37 @@ function formatIndexStart(status: "started" | "already-running" | "skipped-coold
 	}
 }
 
-function notify(ctx: { ui: { notify(message: string, level?: "info" | "warning" | "error"): void } }, message: string, level: "info" | "warning" | "error" = "info"): void {
-	ctx.ui.notify(message, level);
+function notify(ctx: NotifyTarget, message: string, level: NotifyLevel = "info"): void {
+	try {
+		if (ctx.hasUI === false || !ctx.ui) return;
+		ctx.ui.notify(message, level);
+	} catch {
+		// Notifications should never break commands, tools, or background work.
+	}
+}
+
+function notifyLifecycle(ctx: NotifyTarget, message: string, level: NotifyLevel = "info"): void {
+	notify(ctx, `CocoIndex: ${message}`, level);
+}
+
+function makeLifecycleNotifier(ctx: NotifyTarget): LifecycleNotifier {
+	return (message, level = "info") => notifyLifecycle(ctx, message, level);
+}
+
+function emitLifecycle(notifier: LifecycleNotifier | undefined, message: string, level: NotifyLevel = "info"): void {
+	try {
+		notifier?.(message, level);
+	} catch {
+		// Lifecycle notifications are best-effort and must not affect indexing state.
+	}
+}
+
+function canConfirm(ctx: ConfirmTarget): ctx is ConfirmTarget & { ui: NonNullable<ConfirmTarget["ui"]> } {
+	try {
+		return ctx.hasUI !== false && typeof ctx.ui?.confirm === "function";
+	} catch {
+		return false;
+	}
 }
 
 function shellQuote(value: string): string {
@@ -586,6 +674,21 @@ function truncateUtf8(text: string, maxBytes: number, mode: TruncationMode): str
 	let start = 0;
 	while (start < text.length && Buffer.byteLength(text.slice(start), "utf8") > maxBytes) start += 1;
 	return text.slice(start);
+}
+
+function getCooldownRemainingMs(state: ProjectIndexState, now = Date.now()): number {
+	if (!state.lastFailureAt) return 0;
+	return Math.max(0, FAILED_INDEX_COOLDOWN_MS - (now - state.lastFailureAt));
+}
+
+function formatDurationMs(durationMs: number): string {
+	const seconds = Math.max(0, Math.round(durationMs / 1000));
+	if (seconds < 60) return `${seconds}s`;
+	const minutes = Math.floor(seconds / 60);
+	const remainder = seconds % 60;
+	if (minutes < 60) return `${minutes}m ${remainder}s`;
+	const hours = Math.floor(minutes / 60);
+	return `${hours}h ${minutes % 60}m`;
 }
 
 function formatAge(timestamp: number): string {

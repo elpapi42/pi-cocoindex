@@ -1,16 +1,27 @@
 {
   "name": "pi-cocoindex",
   "version": "0.1.0",
-  "type": "module",
   "description": "Pi extension that exposes CocoIndex Code as a simple semantic search tool.",
+  "type": "module",
+  "license": "MIT",
+  "author": "elpapi42",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/elpapi42/pi-cocoindex.git"
+  },
+  "bugs": {
+    "url": "https://github.com/elpapi42/pi-cocoindex/issues"
+  },
+  "homepage": "https://github.com/elpapi42/pi-cocoindex#readme",
   "pi": {
     "extensions": ["./src/index.ts"]
   },
-  "files": ["src/", "README.md"],
+  "files": ["src/", "LICENSE", "README.md"],
   "scripts": {
-    "typecheck": "tsc --noEmit"
+    "typecheck": "tsc --noEmit",
+    "prepublishOnly": "npm run typecheck"
   },
-  "keywords": ["pi", "pi-package", "cocoindex", "semantic-search", "code-search"],
+  "keywords": ["pi", "pi-agent", "pi-package", "extension", "cocoindex", "semantic-search", "code-search"],
   "peerDependencies": {
     "@mariozechner/pi-ai": "*",
     "@mariozechner/pi-agent-core": "*",
