@@ -1,6 +1,8 @@
-import { CccError, errorToMessage, isCancelledError, isCccTimeoutError, isMissingCcc, runCcc } from "./ccc.js";
+import { CccError, errorToMessage, isCccTimeoutError, isMissingCcc, runCcc } from "./ccc.js";
 import { combineOutputs } from "./output.js";
 import type { RunOptions } from "./types.js";
+
+const ACTIVITY_CACHE_TTL_MS = 1_000;
 
 export type CocoIndexActivityUnknownReason = "timeout" | "exit-error" | "parse-error" | "spawn-error";
 
@@ -9,9 +11,45 @@ export type CocoIndexActivity =
 	| { kind: "idle"; source: "ccc-status"; rawStatus: string }
 	| { kind: "unknown"; source: "ccc-status"; reason: CocoIndexActivityUnknownReason; message: string; rawStatus?: string };
 
+interface ActivityCacheEntry {
+	promise?: Promise<CocoIndexActivity>;
+	result?: CocoIndexActivity;
+	checkedAt?: number;
+}
+
+const activityCache = new Map<string, ActivityCacheEntry>();
+
 export async function getCocoIndexActivity(root: string, options: RunOptions): Promise<CocoIndexActivity> {
+	const key = activityCacheKey(root, options.timeoutMs);
+	const now = Date.now();
+	const cached = activityCache.get(key);
+	if (cached?.result && cached.checkedAt && now - cached.checkedAt <= ACTIVITY_CACHE_TTL_MS) {
+		return awaitWithCancellation(cached.result, options.signal);
+	}
+	if (cached?.promise) return awaitWithCancellation(cached.promise, options.signal);
+
+	const promise = readCocoIndexActivity(root, options.timeoutMs);
+	activityCache.set(key, { promise });
+	promise.then(
+		(result) => {
+			const current = activityCache.get(key);
+			if (current?.promise === promise) {
+				const checkedAt = Date.now();
+				activityCache.set(key, { result, checkedAt });
+				scheduleActivityCacheEviction(key, result, checkedAt);
+			}
+		},
+		() => {
+			const current = activityCache.get(key);
+			if (current?.promise === promise) activityCache.delete(key);
+		},
+	);
+	return awaitWithCancellation(promise, options.signal);
+}
+
+async function readCocoIndexActivity(root: string, timeoutMs: number): Promise<CocoIndexActivity> {
 	try {
-		const run = await runCcc(root, ["status"], options);
+		const run = await runCcc(root, ["status"], { timeoutMs });
 		const rawStatus = combineOutputs(run.stdout, run.stderr);
 		const parsed = parseCccStatusActivity(rawStatus);
 		if (parsed === "indexing") {
@@ -31,7 +69,6 @@ export async function getCocoIndexActivity(root: string, options: RunOptions): P
 			rawStatus,
 		};
 	} catch (error) {
-		if (isCancelledError(error, options.signal)) throw error;
 		if (isMissingCcc(error)) throw error;
 		return {
 			kind: "unknown",
@@ -41,6 +78,34 @@ export async function getCocoIndexActivity(root: string, options: RunOptions): P
 			rawStatus: error instanceof CccError ? error.combinedOutput : undefined,
 		};
 	}
+}
+
+function activityCacheKey(root: string, timeoutMs: number): string {
+	return `${root}\0${timeoutMs}`;
+}
+
+function scheduleActivityCacheEviction(key: string, result: CocoIndexActivity, checkedAt: number): void {
+	const timer = setTimeout(() => {
+		const current = activityCache.get(key);
+		if (current?.result === result && current.checkedAt === checkedAt) activityCache.delete(key);
+	}, ACTIVITY_CACHE_TTL_MS);
+	timer.unref?.();
+}
+
+function awaitWithCancellation<T>(value: T | Promise<T>, signal?: AbortSignal): Promise<T> {
+	if (!signal) return Promise.resolve(value);
+	if (signal.aborted) return Promise.reject(makeAbortError());
+	return new Promise<T>((resolve, reject) => {
+		const onAbort = () => reject(makeAbortError());
+		signal.addEventListener("abort", onAbort, { once: true });
+		Promise.resolve(value).then(resolve, reject).finally(() => signal.removeEventListener("abort", onAbort));
+	});
+}
+
+function makeAbortError(): Error {
+	const error = new Error("Cancelled: ccc status");
+	error.name = "AbortError";
+	return error;
 }
 
 export function parseCccStatusActivity(rawStatus: string): "indexing" | "idle" | "unknown" {

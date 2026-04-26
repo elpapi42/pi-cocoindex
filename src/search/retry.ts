@@ -10,11 +10,19 @@ export function makeUnknownActivityRetryMessage(fields: {
 }): string {
 	const originalSearch = ["Original search:", `- query: ${JSON.stringify(fields.query)}`, `- limit: ${fields.limit}`];
 	if (fields.path) originalSearch.push(`- path: ${fields.path}`);
+	const guidance = fields.activity.reason === "timeout"
+		? [
+			"This can happen when many searches run in parallel, when CocoIndex is busy, or when indexing is active.",
+			"Retry this search shortly or reduce parallel search fan-out; use other available tools such as read, bash, grep, find, or ls meanwhile.",
+		]
+		: [
+			"To avoid racing an active index operation, retry this search shortly.",
+			"Use other available tools such as read, bash, grep, find, or ls while CocoIndex settles, or run /cc-status for diagnostics.",
+		];
 	return [
 		`CocoIndex semantic search status could not be confirmed quickly for ${fields.root}.`,
 		`Reason: ${fields.activity.reason}.`,
-		"To avoid racing an active index operation, retry this search shortly.",
-		"Use other available tools such as read, bash, grep, find, or ls while CocoIndex settles, or run /cc-status for diagnostics.",
+		...guidance,
 		"",
 		...originalSearch,
 	].join("\n");
