@@ -311,13 +311,13 @@ function formatSearchMatchSummary(match: SearchMatch, fg: (key: string, value: s
 }
 
 function renderExpandedSearchResultLines(matches: SearchMatch[], details: Partial<SearchDetails> | undefined, fg: (key: string, value: string) => string): string[] {
-	const lines = [fg("toolTitle", `Search results (${matches.length})`)];
+	const lines: string[] = [];
 	if (details?.query) lines.push(`${fg("dim", "query:")} ${fg("accent", JSON.stringify(details.query))}`);
 	if (details?.path) lines.push(`${fg("dim", "path:")} ${fg("toolOutput", details.path)}`);
 	if (details?.projectRoot) lines.push(`${fg("dim", "root:")} ${fg("toolOutput", details.projectRoot)}`);
 	if (details?.backgroundIndex) lines.push(`${fg("dim", "background index:")} ${details.backgroundIndex}`);
 	if (details?.truncated) lines.push(fg("warning", "model-facing output was truncated"));
-	lines.push("");
+	if (lines.length > 0) lines.push("");
 	if (!matches.length) {
 		lines.push(fg("muted", "No parsed matches"));
 		return lines;
